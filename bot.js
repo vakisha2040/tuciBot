@@ -3,7 +3,7 @@ const { getCurrentPrice, waitForFirstPrice, startPolling, stopPolling } = requir
 const { analyze } = require('./technical');
 const bybit = require('./binanceClient');
 
-const TRAILING_DISTANCE = 400; //350
+const TRAILING_DISTANCE = 250; //350
 const TRAILING_THRESHOLD = 300;
 const PROFIT_POINT = 300;
 const ORDER_SIZE = 1;
