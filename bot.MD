@@ -1,206 +1,115 @@
-# Trading Bot Overview
+# Trading Bot Logic Documentation
 
-This document explains the structure, functions, and logic within `bot.js`, which powers an automated trading bot using Bybit/Binance (via `binanceClient`). The bot is designed to manage main and hedge trades, persist state for reliability, and resume safely after interruptions.
+## Overview
 
----
-
-## Table of Contents
-
-1. [Core Purpose](#core-purpose)
-2. [Main Components](#main-components)
-    - [Imports & Constants](#imports--constants)
-    - [State Persistence](#state-persistence)
-    - [Trade Actions](#trade-actions)
-    - [Signal Handling Logic](#signal-handling-logic)
-    - [Monitoring Loop](#monitoring-loop)
-    - [Bot Lifecycle Functions](#bot-lifecycle-functions)
-    - [Resume and Clear State](#resume-and-clear-state)
-3. [Trading Logic](#trading-logic)
-    - [Main Trade Management](#main-trade-management)
-    - [Hedge Trade Management](#hedge-trade-management)
-    - [Trailing Boundary Management](#trailing-boundary-management)
-    - [Profit/Loss Logging](#profitloss-logging)
-4. [Persistence and Recovery](#persistence-and-recovery)
-5. [Usage Guide](#usage-guide)
-6. [Extending the Bot](#extending-the-bot)
+This bot manages two types of trades: **main trades** and **hedge trades**. Its logic is designed to minimize risk and maximize profit by dynamically responding to market signals, using breakthrough prices and trailing boundaries, and promoting hedge trades to main trades when conditions are met.
 
 ---
 
-## Core Purpose
+## Core Concepts
 
-`bot.js` automates trading based on signals generated from market analysis. It manages entry and exit for both main and hedge trades, applies trailing boundaries for risk/profit management, and robustly persists all relevant state so that the bot can recover from restarts, crashes, or manual stops.
-
----
-
-## Main Components
-
-### Imports & Constants
-
-- **Imports:**  
-  - `state.js`: Handles persistent saving/loading of bot status and trade data.
-  - `priceFeed.js`: Provides real-time price updates.
-  - `technical.js`: Runs analysis and generates trading signals.
-  - `binanceClient.js`: Connects to broker for trade execution.
-
-- **Constants:**  
-  - `TRAILING_DISTANCE`, `TRAILING_THRESHOLD`, `PROFIT_POINT`, `ORDER_SIZE`: Parameters for trade and risk logic.
+- **Main Trade:** The primary trading position (Buy/Sell).
+- **Hedge Trade:** A protective position opened when the market moves against the main trade.
+- **Breakthrough Price:** A reference price used to determine when to close or promote trades (main trade’s open price ± 300 points).
+- **Trailing Boundary:** Used for trailing stops (typically 400 points).
+- **Hedge Boundary:** Set 250 points away from the hedge close price; it trails in one direction only (up for Buy, down for Sell).
 
 ---
 
-### State Persistence
+## Trade Lifecycle
 
-The bot uses `state.js` to persist:
-- Bot running status.
-- Main and hedge trade details.
-- Trailing boundaries.
-- Last signal and price.
-- Hedge close boundary.
-- Profit/loss history.
+### 1. Main Trade Opening
 
-Each relevant action triggers a call to `state.saveState()`, ensuring up-to-date disk storage in `state.json`.
+- Opened when a `BUY` or `SELL` signal is received and no main trade is active.
 
----
+### 2. Hedge Trade Opening
 
-### Trade Actions
+- Opened when price moves 300 points against the main trade, or as dictated by signals such as `STOP_LOSS_LONG/SHORT` (if price is NOT above/below breakthrough).
 
-These functions interact with the broker via `binanceClient` and update persistent state:
+### 3. Hedge Promotion to Main Trade
 
-- `openMainTrade(side, price)`: Opens a main trade, saves its details.
-- `closeMainTrade(price)`: Closes the current main trade, logs profit/loss, clears state.
-- `openHedgeTrade(side, price)`: Opens a hedge trade, saves its details.
-- `closeHedgeTrade(price)`: Closes the current hedge trade, logs profit/loss, clears state.
+If both main and hedge trades are active:
+- **Main Trade is Buy:**  
+  If signal is `STOP_LOSS_LONG` **and** price is above breakthrough:
+  - Close main trade.
+  - Promote hedge trade to main trade (without closing/reopening).
+  - Set a new hedge boundary 250 points from the close price, trailing up (for Buy) or down (for Sell).
 
-All functions handle errors and notify via `sendMessage`.
+- **Main Trade is Sell:**  
+  If signal is `STOP_LOSS_SHORT` **and** price is above breakthrough:
+  - Close main trade.
+  - Promote hedge trade to main trade.
+  - Set new hedge boundary as above.
 
----
+### 4. Hedge Trade Closing
 
-### Signal Handling Logic
-
-The core of the bot is the `handleSignal(signal, currentPrice)` function. It:
-
-1. Loads the latest main/hedge trade and hedge boundary from state.
-2. Persists the incoming signal and price.
-3. Applies trading logic:
-    - Opens trades as dictated by signals (`BUY`, `SELL`).
-    - Closes trades when profit/stop-loss conditions are met.
-    - Manages hedge trades when a main trade is threatened.
-    - Applies trailing boundaries for risk management.
-    - Reopens hedge trades if price crosses boundary after closure.
-
-All state changes are saved immediately.
+- Hedge trades are closed only if:
+  - Buy hedge: signal is `STOP_LOSS_LONG` **and** price is above hedge breakthrough.
+  - Sell hedge: signal is `STOP_LOSS_SHORT` **and** price is below hedge breakthrough.
+- After closing a hedge trade, set a new hedge boundary 250 points from the close price, trailing in one direction only.
 
 ---
 
-### Monitoring Loop
+## Boundary Logic
 
-- `monitorPrice()` is the main event loop:
-    - Runs while the bot is marked "running".
-    - Fetches the latest price and trading signal.
-    - Calls `handleSignal()` to act on current market conditions.
-    - Waits 1 second between iterations (customizable).
-
----
-
-### Bot Lifecycle Functions
-
-- `startBot()`:  
-  - Starts price polling.
-  - Waits for first price tick.
-  - Sets bot as running.
-  - Calls `resumeBotState()` to report current state.
-  - Starts monitoring loop.
-
-- `stopBot()`:  
-  - Stops price polling.
-  - Sets bot as not running.
-  - Stops monitoring loop.
+- **Main Trade Boundary:**  
+  Trailed by 400 points, moves both ways.
+- **Hedge Boundary:**  
+  Set 250 points from hedge close/promotion price, trails up for Buy or down for Sell — i.e., it only moves in the direction of increasing profit potential.
 
 ---
 
-### Resume and Clear State
+## Auto-Hedge Feature
 
-- `resumeBotState()`:  
-  - Loads and prints details of open trades, last signal/price, and boundaries from disk.
-  - Does not start trading—just reports what will be resumed.
-
-- `clearBotState()`:  
-  - Stops price polling if running.
-  - Calls `state.resetBotState()` to clear all persisted data for a true fresh start.
-  - Prints a reset message.
+- If main trade exists, no signal, and no hedge trade is active:
+  - If price moves 300 points against main trade, open a hedge trade in the opposite direction.
 
 ---
 
-## Trading Logic
+## Bot Control Functions
 
-### Main Trade Management
-
-- On `BUY` or `SELL` signal: Opens a new main trade if none is open.
-- On `TAKE_PROFIT_*` or `STOP_LOSS_*`: Closes main trade if breakthrough price is met, or opens a hedge trade otherwise.
-
-### Hedge Trade Management
-
-- Opens a hedge trade if main trade is under threat and breakthrough not met.
-- Closes hedge trade when stop-loss/profit condition is met.
-- Sets and trails boundary after hedge closure.
-- Reopens hedge trade if price crosses boundary again.
-
-### Trailing Boundary Management
-
-- Uses `trailBoundary()` to update trailing boundaries after hedge closure.
-- Boundaries are saved in persistent state for recovery and audit.
-
-### Profit/Loss Logging
-
-- Every trade closure logs profit or loss (main/hedge) to state for historical analysis.
+- `startBot()`, `stopBot()`, `resumeBotState()`, `clearBotState()`: Manage bot lifecycle and restore state.
+- `monitorPrice()`: Main loop that checks price and signal, calling trade/signal handlers.
 
 ---
 
-## Persistence and Recovery
+## Example Scenarios
 
-- All trades, boundaries, signals, prices, and P/L logs are saved to disk.
-- On bot restart, `resumeBotState()` shows current status.
-- `startBot()` resumes trading logic using the last saved state, so open positions and boundaries persist across outages.
+### **Main Buy, Hedge Sell, Promotion**
 
----
-
-## Usage Guide
-
-- **Start the Bot:**  
-  `startBot()` — resumes any open trades and begins monitoring/trading.
-
-- **Stop the Bot:**  
-  `stopBot()` — halts price monitoring and trading.
-
-- **Check Current Status:**  
-  `resumeBotState()` — prints details of trades and boundaries.
-
-- **Clear All State for a Fresh Start:**  
-  `clearBotState()` — wipes all persistent state and prepares bot for a new run.
+1. Main trade: BUY 1 BTC @ $26,000.
+2. Price drops to $25,700, hedge trade: SELL 1 BTC @ $25,700.
+3. Price rises to $26,350, signal is `STOP_LOSS_LONG`, breakthrough is $26,300.
+4. Main trade closes (profit: $350).
+5. Hedge trade (SELL @ $25,700) becomes main trade.
+6. New hedge boundary set at $26,100 (250 points above close price); trails down only.
 
 ---
 
-## Extending the Bot
+## Summary Table
 
-- Add new trading signals in `handleSignal()`.
-- Integrate advanced trailing logic or risk management.
-- Enhance P/L tracking and reporting.
-- Connect to other brokers by adapting the trade functions.
-
----
-
-## Example Function Reference
-
-- `startBot()`: Start/resume bot, begin monitoring.
-- `stopBot()`: Stop bot safely.
-- `clearBotState()`: Reset all state.
-- `resumeBotState()`: Report what trades/boundaries will be resumed.
-- `monitorPrice()`: Main event loop, not called directly (used by `startBot()`).
-- Trade and boundary management functions: Open/close main and hedge trades, trail boundaries, persist all state.
+| Condition | Action | Outcome |
+|-----------|--------|---------|
+| Main and Hedge active, STOP_LOSS signal, price above breakthrough | Close main, promote hedge to main, set new hedge boundary | Only main trade remains, boundary trails one way |
+| Signal and price conditions for hedge close | Close hedge, set new boundary | Hedge closed, boundary trails one way |
+| Price moves 300 points against main, no hedge | Open hedge trade | Both trades active |
+| Price/signal favors main | Main trade logic executes | Trade opened/closed as per signal |
 
 ---
 
-## Conclusion
+## Risk Management
 
-`bot.js` is designed for reliability, safety, and extensibility. Every action is persisted, so your trading logic never loses track of positions, even if interrupted. The modular design makes it easy to debug, extend, and operate in production.
+- Only one main and one hedge trade open at any time.
+- Boundaries and breakthroughs reduce exposure to large losses.
+- Promotion logic ensures the bot adapts to trend reversals and keeps risk under control.
 
-For further details on each module (`state.js`, `priceFeed.js`, `technical.js`, `binanceClient.js`), see their respective documentation.
+---
+
+## Version History
+
+- **2025-08:** Added one-way trailing boundary for hedge close and hedge-to-main promotion.
+- **Earlier:** Standard main/hedge logic, breakthrough price logic, auto-hedge feature.
+
+---
+
+For more details, see the code comments in `bot.js`.
