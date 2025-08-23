@@ -6,8 +6,9 @@ const bybit = require('./binanceClient');
 const TRAILING_DISTANCE = 400;
 const TRAILING_THRESHOLD = 300;
 const PROFIT_POINT = 300;
-const ORDER_SIZE = 1; // You can load this from config if needed
+const ORDER_SIZE = 1;
 
+// Helper: Breakthrough price calculation
 function getBreakthroughPrice(trade, type = 'main') {
   if (!trade) return null;
   if (type === 'main') {
@@ -26,6 +27,7 @@ function sendMessage(msg) {
   console.log(msg);
 }
 
+// Trade actions
 async function openMainTrade(side, price) {
   try {
     await bybit.openMainTrade(side, ORDER_SIZE);
@@ -81,15 +83,54 @@ function trailBoundary(side, price, trailingDistance, trailingThreshold) {
   sendMessage(`Boundary for ${side} trade trailed to ${boundary}, maintaining ${trailingDistance} points`);
 }
 
+// MAIN SIGNAL HANDLER WITH PROMOTION LOGIC
 async function handleSignal(signal, currentPrice) {
   let mainTrade = state.getMainTrade();
   let hedgeTrade = state.getHedgeTrade();
-  let hedgeCloseBoundary = state.getHedgeCloseBoundary();
 
   state.setLastSignal(signal);
   state.setLastPrice(currentPrice);
 
-  // --- Main Trade Logic ---
+  // --- PROMOTION LOGIC: Hedge becomes main if STOP_LOSS signal and price above breakthrough ---
+  if (mainTrade && hedgeTrade) {
+    const mainBreakthrough = getBreakthroughPrice(mainTrade);
+    // Main BUY logic
+    if (
+      mainTrade.side === 'Buy' &&
+      signal === 'STOP_LOSS_LONG' &&
+      currentPrice > mainBreakthrough
+    ) {
+      await closeMainTrade(currentPrice); // Close main trade
+      // Promote hedge to main trade without closing
+      state.setMainTrade({ side: hedgeTrade.side, openPrice: hedgeTrade.openPrice });
+      state.clearHedgeTrade();
+      // Set new trailing boundary for the new main trade
+      trailBoundary(hedgeTrade.side, currentPrice, TRAILING_DISTANCE, TRAILING_THRESHOLD);
+      sendMessage(`Main BUY trade closed, hedge promoted to main. Boundary set at ${currentPrice}.`);
+      state.saveState();
+      mainTrade = state.getMainTrade(); // refresh reference
+      hedgeTrade = null;
+      return;
+    }
+    // Main SELL logic
+    if (
+      mainTrade.side === 'Sell' &&
+      signal === 'STOP_LOSS_SHORT' &&
+      currentPrice > mainBreakthrough
+    ) {
+      await closeMainTrade(currentPrice); // Close main trade
+      state.setMainTrade({ side: hedgeTrade.side, openPrice: hedgeTrade.openPrice });
+      state.clearHedgeTrade();
+      trailBoundary(hedgeTrade.side, currentPrice, TRAILING_DISTANCE, TRAILING_THRESHOLD);
+      sendMessage(`Main SELL trade closed, hedge promoted to main. Boundary set at ${currentPrice}.`);
+      state.saveState();
+      mainTrade = state.getMainTrade();
+      hedgeTrade = null;
+      return;
+    }
+  }
+
+  // --- Main Trade Logic (standard) ---
   switch (signal) {
     case 'BUY':
       if (!mainTrade) {
@@ -97,7 +138,6 @@ async function handleSignal(signal, currentPrice) {
         mainTrade = state.getMainTrade();
       }
       break;
-
     case 'TAKE_PROFIT_LONG':
       if (mainTrade && mainTrade.side === 'Buy') {
         const breakthrough = getBreakthroughPrice(mainTrade);
@@ -110,7 +150,6 @@ async function handleSignal(signal, currentPrice) {
         }
       }
       break;
-
     case 'STOP_LOSS_LONG':
       if (mainTrade && mainTrade.side === 'Buy') {
         const breakthrough = getBreakthroughPrice(mainTrade);
@@ -122,14 +161,12 @@ async function handleSignal(signal, currentPrice) {
         }
       }
       break;
-
     case 'SELL':
       if (!mainTrade) {
         await openMainTrade('Sell', currentPrice);
         mainTrade = state.getMainTrade();
       }
       break;
-
     case 'TAKE_PROFIT_SHORT':
       if (mainTrade && mainTrade.side === 'Sell') {
         const breakthrough = getBreakthroughPrice(mainTrade);
@@ -141,7 +178,6 @@ async function handleSignal(signal, currentPrice) {
         }
       }
       break;
-
     case 'STOP_LOSS_SHORT':
       if (mainTrade && mainTrade.side === 'Sell') {
         const breakthrough = getBreakthroughPrice(mainTrade);
@@ -155,76 +191,38 @@ async function handleSignal(signal, currentPrice) {
       break;
   }
 
-  // --- Hedge Trade Logic ---
+  // --- Hedge Trade Logic: CLOSE only on STOP_LOSS_LONG or STOP_LOSS_SHORT (with price above/below breakthrough) ---
   hedgeTrade = state.getHedgeTrade();
   if (hedgeTrade) {
     const hedgeBreakthrough = getBreakthroughPrice(hedgeTrade, 'hedge');
-    if (hedgeTrade.side === 'Buy') {
-      switch (signal) {
-        case 'BUY':
-        case 'TAKE_PROFIT_LONG':
-          sendMessage('Buy hedge is running strong');
-          break;
-        case 'STOP_LOSS_LONG':
-          if (currentPrice > hedgeBreakthrough) {
-            await closeHedgeTrade(currentPrice);
-            state.setHedgeCloseBoundary(currentPrice);
-            trailBoundary('Sell', currentPrice, TRAILING_DISTANCE, TRAILING_THRESHOLD);
-            hedgeTrade = null;
-          }
-          break;
-      }
-    } else if (hedgeTrade.side === 'Sell') {
-      switch (signal) {
-        case 'SELL':
-        case 'TAKE_PROFIT_SHORT':
-          sendMessage('Sell hedge is running strong');
-          break;
-        case 'STOP_LOSS_SHORT':
-          if (currentPrice < hedgeBreakthrough) {
-            await closeHedgeTrade(currentPrice);
-            state.setHedgeCloseBoundary(currentPrice);
-            trailBoundary('Buy', currentPrice, TRAILING_DISTANCE, TRAILING_THRESHOLD);
-            hedgeTrade = null;
-          }
-          break;
-      }
+    if (
+      (hedgeTrade.side === 'Buy' && signal === 'STOP_LOSS_LONG' && currentPrice > hedgeBreakthrough) ||
+      (hedgeTrade.side === 'Sell' && signal === 'STOP_LOSS_SHORT' && currentPrice < hedgeBreakthrough)
+    ) {
+      await closeHedgeTrade(currentPrice);
+      sendMessage(`Hedge trade closed on ${signal} and price above breakthrough.`);
     }
-    hedgeCloseBoundary = state.getHedgeCloseBoundary();
-    if (hedgeCloseBoundary && (
-      (hedgeTrade && hedgeTrade.side === 'Sell' && currentPrice >= hedgeCloseBoundary) ||
-      (hedgeTrade && hedgeTrade.side === 'Buy' && currentPrice <= hedgeCloseBoundary)
-    )) {
-      await openHedgeTrade(hedgeTrade.side, currentPrice);
-      state.clearHedgeCloseBoundary();
-    }
+    // If signal is present but price not above/below breakthrough, do nothing
   }
   state.saveState();
 }
 
-// --- New Logic: Auto Hedge on Price Drop ---
+// Auto-hedge logic
 async function autoHedgeCheck(currentPrice, signal) {
   const mainTrade = state.getMainTrade();
   const hedgeTrade = state.getHedgeTrade();
-  // Only if mainTrade is open, no signal, and no hedgeTrade
   if (mainTrade && !signal && !hedgeTrade) {
-    if (mainTrade.side === 'Buy') {
-      // If price drops 300 points below open price
-      if (currentPrice <= mainTrade.openPrice - PROFIT_POINT) {
-        await openHedgeTrade('Sell', currentPrice);
-        sendMessage('Auto-hedge SELL opened as price dropped 300 points below main BUY trade!');
-      }
-    } else if (mainTrade.side === 'Sell') {
-      // If price rises 300 points above open price
-      if (currentPrice >= mainTrade.openPrice + PROFIT_POINT) {
-        await openHedgeTrade('Buy', currentPrice);
-        sendMessage('Auto-hedge BUY opened as price rose 300 points above main SELL trade!');
-      }
+    if (mainTrade.side === 'Buy' && currentPrice <= mainTrade.openPrice - PROFIT_POINT) {
+      await openHedgeTrade('Sell', currentPrice);
+      sendMessage('Auto-hedge SELL opened as price dropped 300 points below main BUY trade!');
+    }
+    if (mainTrade.side === 'Sell' && currentPrice >= mainTrade.openPrice + PROFIT_POINT) {
+      await openHedgeTrade('Buy', currentPrice);
+      sendMessage('Auto-hedge BUY opened as price rose 300 points above main SELL trade!');
     }
   }
 }
 
-// --- Monitoring Loop ---
 let monitoring = false;
 async function monitorPrice() {
   monitoring = true;
@@ -232,15 +230,11 @@ async function monitorPrice() {
     try {
       const currentPrice = getCurrentPrice();
       const signal = await analyze();
-
-      // Handle regular signal logic
       if (typeof signal === 'string' && typeof currentPrice === 'number') {
         await handleSignal(signal, currentPrice);
       } else {
-        // No signal: check auto-hedge
         await autoHedgeCheck(currentPrice, signal);
       }
-
       await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (err) {
       sendMessage(`Monitor error: ${err.message}`);
@@ -249,7 +243,6 @@ async function monitorPrice() {
   }
 }
 
-// --- Start/Stop with resume ---
 async function startBot() {
   startPolling(1000);
   await waitForFirstPrice();
