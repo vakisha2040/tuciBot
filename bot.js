@@ -3,12 +3,12 @@ const { getCurrentPrice, waitForFirstPrice, startPolling, stopPolling } = requir
 const { analyze } = require('./technical');
 const bybit = require('./binanceClient');
 
-const TRAILING_DISTANCE = 250; //350
-const TRAILING_THRESHOLD = 300;
-const PROFIT_POINT = 300;
+const TRAILING_DISTANCE = 250; //250 boundry distance from price
+const TRAILING_THRESHOLD = 300;// move for every 350 point
+const PROFIT_POINT = 300; // for breakthrough price calculation
 const ORDER_SIZE = 1;
 const HEDGE_BOUNDARY_DISTANCE = 250; // For promoted hedge or closed hedge
-const HEDGE_BOUNDARY_MAIN_DISTANCE = 300; // 250 For main trade trailing hedge boundary
+const HEDGE_BOUNDARY_MAIN_DISTANCE = 250; // 250 For main trade trailing hedge boundary
 
 // Helper: Breakthrough price calculation
 function getBreakthroughPrice(trade, type = 'main') {
@@ -249,6 +249,7 @@ async function monitorPrice() {
       const currentPrice = getCurrentPrice();
       const signal = await analyze();
       await handleSignal(signal, currentPrice);
+       await autoHedgeCheck(currentPrice, signal);
 
       // --- Main hedge boundary trailing and trigger logic ---
       const mainTrade = state.getMainTrade();
