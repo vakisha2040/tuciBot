@@ -1,81 +1,76 @@
-const fs = require('fs');
-const path = require('path');
+// state.js - cleaned up for hedge → main breakthrough system
+const fs = require("fs");
+const path = require("path");
 
-const STATE_FILE = path.join(__dirname, 'state.json');
+const STATE_FILE = path.join(__dirname, "state.json");
 
-// Default state structure for extended bot logic
 let state = {
-  botRunning: false,
-  mainTrade: null,         // { side, openPrice, ... }
-  hedgeTrade: null,        // { side, openPrice, ... }
-  hedgeCloseBoundary: null,
-  trailingBoundaries: [],  // Array of trailing boundary records
-  lastSignal: null,        // Last signal processed
-  lastPrice: null,         // Last price processed
-  cooldownUntil: 0,
-  profitLoss: [],          // Array of { type, amount, timestamp }
-  // Add future fields here
+  running: false,
+  mainTrade: null,              // { id, side, qty, openPrice, breakthroughPrice }
+  hedgeTrade: null,             // { id, side, qty, openPrice, breakthroughPrice }
+  mainHedgeBoundary: null,      // { side, boundary, price, timestamp }
+  hedgeCloseBoundary: null,     // { side, boundary, price, timestamp }
+  lastSignal: null,             // 'BUY' | 'SELL' | 'WAIT'
+  lastPrice: null,
+  createdAt: Date.now(),
+  updatedAt: Date.now(),
 };
 
-// --- Persistence ---
+// ---- persistence ----
+function saveState() {
+  state.updatedAt = Date.now();
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
 function loadState() {
-  try {
-    const data = fs.readFileSync(STATE_FILE, 'utf-8');
-    state = JSON.parse(data);
-  } catch (err) {
-    saveState(); // Write default state if file doesn't exist
+  if (fs.existsSync(STATE_FILE)) {
+    try {
+      const raw = fs.readFileSync(STATE_FILE);
+      state = JSON.parse(raw);
+    } catch (e) {
+      console.error("⚠️ Failed to load state.json, using defaults", e);
+    }
   }
 }
-function saveState() {
-  // Atomic write for safety
-  const tmpFile = STATE_FILE + '.tmp';
-  fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2));
-  fs.renameSync(tmpFile, STATE_FILE);
-}
 
-// Load state at startup
-loadState();
-
-// --- Bot control ---
-function startBot() {
-  state.botRunning = true;
-  saveState();
-}
-function stopBot() {
-  state.botRunning = false;
-  saveState();
-}
-function isRunning() {
-  return !!state.botRunning;
-}
-
-// --- Main Trade ---
+// ---- trade management ----
 function setMainTrade(trade) {
   state.mainTrade = trade;
-  saveState();
-}
-function clearMainTrade() {
-  state.mainTrade = null;
   saveState();
 }
 function getMainTrade() {
   return state.mainTrade;
 }
-
-// --- Hedge Trade ---
-function setHedgeTrade(trade) {
-  state.hedgeTrade = trade;
+function clearMainTrade() {
+  state.mainTrade = null;
   saveState();
 }
-function clearHedgeTrade() {
-  state.hedgeTrade = null;
+
+function setHedgeTrade(trade) {
+  state.hedgeTrade = trade;
   saveState();
 }
 function getHedgeTrade() {
   return state.hedgeTrade;
 }
+function clearHedgeTrade() {
+  state.hedgeTrade = null;
+  saveState();
+}
 
-// --- Hedge Boundary ---
+// ---- hedge boundaries ----
+function setMainHedgeBoundary(boundary) {
+  state.mainHedgeBoundary = boundary;
+  saveState();
+}
+function getMainHedgeBoundary() {
+  return state.mainHedgeBoundary;
+}
+function clearMainHedgeBoundary() {
+  state.mainHedgeBoundary = null;
+  saveState();
+}
+
 function setHedgeCloseBoundary(boundary) {
   state.hedgeCloseBoundary = boundary;
   saveState();
@@ -88,108 +83,60 @@ function clearHedgeCloseBoundary() {
   saveState();
 }
 
-// --- Trailing Boundaries ---
-function addTrailingBoundary(boundary) {
-  state.trailingBoundaries.push(boundary);
-  saveState();
-}
-function getTrailingBoundaries() {
-  return state.trailingBoundaries || [];
-}
-function clearTrailingBoundaries() {
-  state.trailingBoundaries = [];
-  saveState();
-}
-
-// --- Signal & Price ---
-function setLastSignal(signal) {
+// ---- signals ----
+function setLastSignal(signal, price) {
   state.lastSignal = signal;
-  saveState();
-}
-function getLastSignal() {
-  return state.lastSignal;
-}
-function setLastPrice(price) {
   state.lastPrice = price;
   saveState();
 }
-function getLastPrice() {
-  return state.lastPrice;
+function getLastSignal() {
+  return { signal: state.lastSignal, price: state.lastPrice };
 }
 
-// --- Cooldown ---
-function setCooldown(seconds) {
-  state.cooldownUntil = Date.now() + seconds * 1000;
+// ---- lifecycle ----
+function setRunning(r) {
+  state.running = r;
   saveState();
 }
-function isCooldown() {
-  return Date.now() < state.cooldownUntil;
-}
-function getCooldownUntil() {
-  return state.cooldownUntil;
+function isRunning() {
+  return state.running;
 }
 
-// --- Profit/Loss logging ---
-function logProfitLoss(type, amount) {
-  state.profitLoss.push({
-    type,
-    amount,
-    timestamp: Date.now()
-  });
-  saveState();
-}
-function getProfitLossHistory() {
-  return state.profitLoss || [];
-}
-function clearProfitLossHistory() {
-  state.profitLoss = [];
-  saveState();
-}
-
-// --- Bulk clear for full bot reset ---
-function resetBotState() {
+// ---- reset ----
+function resetState() {
   state = {
-    botRunning: false,
+    running: false,
     mainTrade: null,
     hedgeTrade: null,
+    mainHedgeBoundary: null,
     hedgeCloseBoundary: null,
-    trailingBoundaries: [],
     lastSignal: null,
     lastPrice: null,
-    cooldownUntil: 0,
-    profitLoss: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
   };
   saveState();
 }
 
-// --- Exports ---
+// ---- init load ----
+loadState();
+
 module.exports = {
-  startBot,
-  stopBot,
-  isRunning,
+  getMainTrade,
   setMainTrade,
   clearMainTrade,
-  getMainTrade,
+  getHedgeTrade,
   setHedgeTrade,
   clearHedgeTrade,
-  getHedgeTrade,
-  setHedgeCloseBoundary,
+  getMainHedgeBoundary,
+  setMainHedgeBoundary,
+  clearMainHedgeBoundary,
   getHedgeCloseBoundary,
+  setHedgeCloseBoundary,
   clearHedgeCloseBoundary,
-  addTrailingBoundary,
-  getTrailingBoundaries,
-  clearTrailingBoundaries,
   setLastSignal,
   getLastSignal,
-  setLastPrice,
-  getLastPrice,
-  setCooldown,
-  isCooldown,
-  getCooldownUntil,
-  logProfitLoss,
-  getProfitLossHistory,
-  clearProfitLossHistory,
-  saveState,
-  loadState,
-  resetBotState,
+  setRunning,
+  isRunning,
+  resetState,
 };
