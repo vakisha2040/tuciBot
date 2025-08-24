@@ -1,0 +1,30 @@
+{
+  "symbol": "BTCUSDT",
+  "leverage": 20,
+
+  "entrySize": 0.002,              // contract size per trade
+  "pricePrecision": 2,             // exchange price decimals
+  "quantityPrecision": 3,          // exchange qty decimals
+
+  "boundaryGap": 300,              // boundary always stays 300 points from current price
+  "minTrailMove": 400,             // price must move at least 400 points in profit direction to shift boundary
+
+  "breakthroughOffset": 100,       // buffer above/below entry price to define breakthrough
+  "stopLoss": 600,                 // hedge stop loss distance
+  "takeProfit": 1200,              // hedge take profit distance
+
+  "pollInterval": 2000,            // ms between price updates
+  "cooldownMs": 10000,             // ms delay before allowing new hedge
+
+  "telegram": {
+    "enabled": true,
+    "botToken": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chatId": "YOUR_CHAT_ID"
+  },
+
+  "exchange": {
+    "apiKey": "YOUR_EXCHANGE_API_KEY",
+    "secret": "YOUR_EXCHANGE_SECRET",
+    "baseUrl": "https://fapi.binance.com"   // for Binance Futures; replace if using another exchange
+  }
+}
