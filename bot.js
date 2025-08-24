@@ -1,310 +1,304 @@
+// bot.js
 const state = require('./state');
 const { getCurrentPrice, waitForFirstPrice, startPolling, stopPolling } = require('./priceFeed');
 const { analyze } = require('./technical');
 const bybit = require('./binanceClient');
 
-const TRAILING_DISTANCE = 250; //250 boundry distance from price
-const TRAILING_THRESHOLD = 300;// move for every 350 point
-const PROFIT_POINT = 300; // for breakthrough price calculation
+/**
+ * ====================== CONFIG ======================
+ */
 const ORDER_SIZE = 1;
-const HEDGE_BOUNDARY_DISTANCE = 250; // For promoted hedge or closed hedge
-const HEDGE_BOUNDARY_MAIN_DISTANCE = 250; // 250 For main trade trailing hedge boundary
 
-// Helper: Breakthrough price calculation
-function getBreakthroughPrice(trade, type = 'main') {
-  if (!trade) return null;
-  if (type === 'main' || type === 'hedge') {
-    return trade.side === 'Buy'
-      ? trade.openPrice + PROFIT_POINT
-      : trade.openPrice - PROFIT_POINT;
+// Breakthrough distance (+/- from entry)
+const PROFIT_POINT = 300;
+
+// Main trailing rules
+const TRAIL_GAP = 300;        // boundary gap from current price
+const TRAIL_ACTIVATION = 400; // start trailing only after this much profit
+
+// Cooldowns / guards
+const HEDGE_COOLDOWN_MS = 5000;
+
+/**
+ * ====================== INTERNAL FLAGS ======================
+ */
+let monitoring = false;
+let hedgeOpeningInProgress = false;
+let mainOpeningInProgress = false;
+let lastHedgeOpenAt = 0;
+
+/**
+ * ====================== HELPERS ======================
+ */
+const now = () => Date.now();
+const sendMessage = (m) => console.log(m);
+const hedgeCooldownActive = () => now() - lastHedgeOpenAt < HEDGE_COOLDOWN_MS;
+const markHedgeOpened = () => { lastHedgeOpenAt = now(); };
+
+function computeBreakthrough(side, openPrice) {
+  return side === 'Buy' ? openPrice + PROFIT_POINT : openPrice - PROFIT_POINT;
+}
+function isBeyondBreakthrough(side, price, breakthrough) {
+  return side === 'Buy' ? price >= breakthrough : price <= breakthrough;
+}
+
+/**
+ * ====================== MAIN BOUNDARY (TRAILING) ======================
+ * One-way, 300-pt gap, activates after >= 400 profit move
+ */
+function setMainBoundary(side, refPrice) {
+  const boundary = side === 'Buy' ? refPrice - TRAIL_GAP : refPrice + TRAIL_GAP;
+  state.setMainHedgeBoundary({ side, boundary, price: refPrice, timestamp: now() });
+  sendMessage(`Main boundary set @ ${boundary} (gap ${TRAIL_GAP}) for ${side}.`);
+}
+function clearMainBoundary() {
+  state.clearMainHedgeBoundary?.();
+}
+
+function trailMainBoundary(mainTrade, currentPrice) {
+  if (!mainTrade) return;
+  const { side, openPrice } = mainTrade;
+
+  // Only trail after >= 400 pts profit from entry
+  const profitProgress = side === 'Buy'
+    ? currentPrice - openPrice
+    : openPrice - currentPrice;
+  if (profitProgress < TRAIL_ACTIVATION) return;
+
+  const targetBoundary = side === 'Buy'
+    ? currentPrice - TRAIL_GAP
+    : currentPrice + TRAIL_GAP;
+
+  const existing = state.getMainHedgeBoundary();
+  if (!existing) {
+    state.setMainHedgeBoundary({ side, boundary: targetBoundary, price: currentPrice, timestamp: now() });
+    sendMessage(`Main boundary initialized (trail) -> ${targetBoundary}`);
+    return;
   }
-  return null;
+
+  // One-way tighten only
+  const shouldTighten =
+    (side === 'Buy' && targetBoundary > existing.boundary) ||
+    (side === 'Sell' && targetBoundary < existing.boundary);
+
+  if (shouldTighten) {
+    state.setMainHedgeBoundary({ side, boundary: targetBoundary, price: currentPrice, timestamp: now() });
+    sendMessage(`Main boundary tightened -> ${targetBoundary}`);
+  }
 }
 
-function sendMessage(msg) {
-  console.log(msg);
-}
-
-// Trade actions
+/**
+ * ====================== TRADE ACTIONS ======================
+ * We store breakthrough on both main and hedge trades.
+ */
 async function openMainTrade(side, price) {
+  if (mainOpeningInProgress) return;
+  mainOpeningInProgress = true;
   try {
     await bybit.openMainTrade(side, ORDER_SIZE);
-    sendMessage(`Opened main trade ${side} at ${price}`);
-    state.setMainTrade({ side, openPrice: price });
-    trailMainHedgeBoundary(side, price, price); // Set initial main hedge boundary
+    const breakthrough = computeBreakthrough(side, price);
+    state.setMainTrade({ side, openPrice: price, breakthrough });
+    setMainBoundary(side, price);
     state.saveState();
+    sendMessage(`Opened MAIN ${side} @ ${price} (breakthrough ${breakthrough}).`);
   } catch (e) {
-    sendMessage(`Failed to open main trade: ${e.message}`);
+    sendMessage(`Failed to open main trade: ${e.message || e}`);
+  } finally {
+    mainOpeningInProgress = false;
   }
 }
+
 async function closeMainTrade(price) {
+  const trade = state.getMainTrade();
+  if (!trade) return;
   try {
-    const trade = state.getMainTrade();
-    if (!trade) return;
     await bybit.closeMainTrade(trade.side, ORDER_SIZE);
-    sendMessage(`Closed main trade ${trade.side} at ${price}`);
-    state.logProfitLoss('main', (price - trade.openPrice) * (trade.side === 'Buy' ? 1 : -1));
+    const pnl = (price - trade.openPrice) * (trade.side === 'Buy' ? 1 : -1);
+    state.logProfitLoss('main', pnl);
     state.clearMainTrade();
-    state.clearMainHedgeBoundary();
+    clearMainBoundary();
     state.saveState();
+    sendMessage(`Closed MAIN ${trade.side} @ ${price} (PnL ${pnl}).`);
   } catch (e) {
-    sendMessage(`Failed to close main trade: ${e.message}`);
+    sendMessage(`Failed to close main trade: ${e.message || e}`);
   }
 }
+
 async function openHedgeTrade(side, price) {
+  if (hedgeOpeningInProgress) return;
+  if (hedgeCooldownActive()) {
+    sendMessage(`Skip hedge open: cooldown (${HEDGE_COOLDOWN_MS} ms).`);
+    return;
+  }
+  if (state.getHedgeTrade()) {
+    sendMessage('Skip hedge open: hedge already exists.');
+    return;
+  }
+  hedgeOpeningInProgress = true;
   try {
     await bybit.openHedgeTrade(side, ORDER_SIZE);
-    sendMessage(`Opened hedge trade ${side} at ${price}`);
-    state.setHedgeTrade({ side, openPrice: price });
+    const breakthrough = computeBreakthrough(side, price);
+    state.setHedgeTrade({ side, openPrice: price, breakthrough });
     state.saveState();
+    markHedgeOpened();
+    sendMessage(`Opened HEDGE ${side} @ ${price} (breakthrough ${breakthrough}).`);
   } catch (e) {
-    sendMessage(`Failed to open hedge trade: ${e.message}`);
+    sendMessage(`Failed to open hedge: ${e.message || e}`);
+  } finally {
+    hedgeOpeningInProgress = false;
   }
 }
+
 async function closeHedgeTrade(price) {
+  const trade = state.getHedgeTrade();
+  if (!trade) return;
   try {
-    const trade = state.getHedgeTrade();
-    if (!trade) return;
     await bybit.closeHedgeTrade(trade.side, ORDER_SIZE);
-    sendMessage(`Closed hedge trade ${trade.side} at ${price}`);
-    state.logProfitLoss('hedge', (price - trade.openPrice) * (trade.side === 'Buy' ? 1 : -1));
+    const pnl = (price - trade.openPrice) * (trade.side === 'Buy' ? 1 : -1);
+    state.logProfitLoss('hedge', pnl);
     state.clearHedgeTrade();
     state.saveState();
+    sendMessage(`Closed HEDGE ${trade.side} @ ${price} (PnL ${pnl}).`);
   } catch (e) {
-    sendMessage(`Failed to close hedge trade: ${e.message}`);
+    sendMessage(`Failed to close hedge: ${e.message || e}`);
   }
 }
 
-// Trailing boundary for main trade
-function trailBoundary(side, price, trailingDistance, trailingThreshold) {
-  let boundary = side === 'Buy'
-    ? price - trailingDistance
-    : price + trailingDistance;
-  state.addTrailingBoundary({ side, boundary, price, timestamp: Date.now() });
-  sendMessage(`Boundary for ${side} trade trailed to ${boundary}, maintaining ${trailingDistance} points`);
-}
+/**
+ * ====================== CORE DECISION LOGIC ======================
+ */
 
-// Trailing boundary for hedge trade (ONE WAY TRAIL UP)
-function trailHedgeBoundary(side, price) {
-  let boundary;
-  if (side === 'Buy') {
-    boundary = price - HEDGE_BOUNDARY_DISTANCE;
-    state.setHedgeBoundary({ side, boundary, price, timestamp: Date.now() });
-    sendMessage(`Hedge boundary for BUY trailed up to ${boundary}, 250 points below price`);
-  } else if (side === 'Sell') {
-    boundary = price + HEDGE_BOUNDARY_DISTANCE;
-    state.setHedgeBoundary({ side, boundary, price, timestamp: Date.now() });
-    sendMessage(`Hedge boundary for SELL trailed down to ${boundary}, 250 points above price`);
-  }
-}
+// Called when main boundary is hit
+async function onMainBoundaryHit(currentPrice) {
+  const main = state.getMainTrade();
+  if (!main) return;
 
-// Trailing boundary for main trade hedge (ONE WAY TRAIL UP)
-function trailMainHedgeBoundary(side, mainEntry, currentPrice) {
-  let boundary;
-  if (side === 'Buy') {
-    boundary = currentPrice - HEDGE_BOUNDARY_MAIN_DISTANCE;
-    const existing = state.getMainHedgeBoundary();
-    if (!existing || boundary > existing.boundary) {
-      state.setMainHedgeBoundary({ side, boundary, price: currentPrice, timestamp: Date.now() });
-      sendMessage(`Main hedge boundary for BUY trailed up to ${boundary} (300 points below price)`);
+  const { side, breakthrough } = main;
+  // Check breakthrough FIRST (your rule)
+  if (isBeyondBreakthrough(side, currentPrice, breakthrough)) {
+    // Close the main favorably
+    await closeMainTrade(currentPrice);
+
+    // If a hedge exists, TRANSFORM hedge → main (carry over hedge breakthrough)
+    const hedge = state.getHedgeTrade();
+    if (hedge) {
+      state.setMainTrade({
+        side: hedge.side,
+        openPrice: hedge.openPrice,
+        breakthrough: hedge.breakthrough, // NOTE: hedge breakthrough becomes main breakthrough
+      });
+      state.clearHedgeTrade();
+      // New boundary at 300 gap from current price
+      setMainBoundary(hedge.side, currentPrice);
+      state.saveState();
+      sendMessage(`TRANSFORM: Hedge (${hedge.side}) → MAIN. Breakthrough carried over: ${hedge.breakthrough}.`);
     }
-  } else if (side === 'Sell') {
-    boundary = currentPrice + HEDGE_BOUNDARY_MAIN_DISTANCE;
-    const existing = state.getMainHedgeBoundary();
-    if (!existing || boundary < existing.boundary) {
-      state.setMainHedgeBoundary({ side, boundary, price: currentPrice, timestamp: Date.now() });
-      sendMessage(`Main hedge boundary for SELL trailed down to ${boundary} (300 points above price)`);
-    }
+  } else {
+    // Not beyond breakthrough → open hedge instead of closing the main
+    const hedgeSide = side === 'Buy' ? 'Sell' : 'Buy';
+    await openHedgeTrade(hedgeSide, currentPrice);
+    sendMessage(`Boundary hit but not beyond breakthrough → opened HEDGE ${hedgeSide}.`);
   }
 }
 
-// MAIN SIGNAL HANDLER WITH PROMOTION LOGIC AND HEDGE TRAILING
+// Hedge closing logic on STOP_LOSS or TAKE_PROFIT signals
+async function maybeCloseHedgeOnSignal(signal, currentPrice) {
+  if (!signal) return;
+  if (!/STOP_LOSS|TAKE_PROFIT/.test(signal)) return;
+
+  const hedge = state.getHedgeTrade();
+  if (!hedge) return;
+
+  // Check hedge breakthrough FIRST (your rule)
+  if (isBeyondBreakthrough(hedge.side, currentPrice, hedge.breakthrough)) {
+    await closeHedgeTrade(currentPrice);
+
+    // Reset main boundary to 300 gap from this price (if a main exists)
+    const main = state.getMainTrade();
+    if (main) {
+      setMainBoundary(main.side, currentPrice);
+      state.saveState();
+      sendMessage('Hedge closed on signal beyond breakthrough → main boundary reset to 300 gap from current price.');
+    }
+  } else {
+    // Do nothing (hold hedge)
+    sendMessage('Hedge signal received but price not beyond hedge breakthrough → holding hedge.');
+  }
+}
+
+/**
+ * ====================== SIGNAL HANDLER ======================
+ */
 async function handleSignal(signal, currentPrice) {
-  let mainTrade = state.getMainTrade();
-  let hedgeTrade = state.getHedgeTrade();
+  let main = state.getMainTrade();
 
   state.setLastSignal(signal);
   state.setLastPrice(currentPrice);
 
-  // --- PROMOTION LOGIC: Hedge becomes main if STOP_LOSS signal and price above breakthrough ---
-  if (mainTrade && hedgeTrade) {
-    const mainBreakthrough = getBreakthroughPrice(mainTrade);
-    // Main BUY logic
-    if (
-      mainTrade.side === 'Buy' &&
-      signal === 'STOP_LOSS_LONG' &&
-      currentPrice > mainBreakthrough
-    ) {
-      await closeMainTrade(currentPrice); // Close main trade
-      // Promote hedge to main trade without closing
-      state.setMainTrade({ side: hedgeTrade.side, openPrice: hedgeTrade.openPrice });
-      state.clearHedgeTrade();
-      trailHedgeBoundary(hedgeTrade.side, currentPrice);
-      sendMessage(`Main BUY trade closed, hedge promoted to main. New hedge boundary set at ${currentPrice}.`);
-      state.saveState();
-      mainTrade = state.getMainTrade();
-      hedgeTrade = null;
-      return;
-    }
-    // Main SELL logic
-    if (
-      mainTrade.side === 'Sell' &&
-      signal === 'STOP_LOSS_SHORT' &&
-      currentPrice > mainBreakthrough
-    ) {
-      await closeMainTrade(currentPrice); // Close main trade
-      state.setMainTrade({ side: hedgeTrade.side, openPrice: hedgeTrade.openPrice });
-      state.clearHedgeTrade();
-      trailHedgeBoundary(hedgeTrade.side, currentPrice);
-      sendMessage(`Main SELL trade closed, hedge promoted to main. New hedge boundary set at ${currentPrice}.`);
-      state.saveState();
-      mainTrade = state.getMainTrade();
-      hedgeTrade = null;
-      return;
-    }
-  }
+  // Hedge close rule (STOP_LOSS / TAKE_PROFIT) based on hedge breakthrough
+  await maybeCloseHedgeOnSignal(signal, currentPrice);
 
-  // --- Main Trade Logic (standard) ---
+  // Basic main open on BUY/SELL signal
   switch (signal) {
     case 'BUY':
-      if (!mainTrade) {
-        await openMainTrade('Buy', currentPrice);
-        mainTrade = state.getMainTrade();
-      }
-      break;
-    case 'TAKE_PROFIT_LONG':
-      if (mainTrade && mainTrade.side === 'Buy') {
-        const breakthrough = getBreakthroughPrice(mainTrade);
-        if (currentPrice > breakthrough) {
-          await closeMainTrade(currentPrice);
-          mainTrade = null;
-          state.clearHedgeCloseBoundary();
-        } else {
-          await openHedgeTrade('Sell', currentPrice);
-        }
-      }
-      break;
-    case 'STOP_LOSS_LONG':
-      if (mainTrade && mainTrade.side === 'Buy') {
-        const breakthrough = getBreakthroughPrice(mainTrade);
-        if (currentPrice > breakthrough) {
-          await closeMainTrade(currentPrice);
-          mainTrade = null;
-        } else {
-          await openHedgeTrade('Sell', currentPrice);
-        }
-      }
+      if (!main) await openMainTrade('Buy', currentPrice);
       break;
     case 'SELL':
-      if (!mainTrade) {
-        await openMainTrade('Sell', currentPrice);
-        mainTrade = state.getMainTrade();
-      }
+      if (!main) await openMainTrade('Sell', currentPrice);
       break;
-    case 'TAKE_PROFIT_SHORT':
-      if (mainTrade && mainTrade.side === 'Sell') {
-        const breakthrough = getBreakthroughPrice(mainTrade);
-        if (currentPrice < breakthrough) {
-          await closeMainTrade(currentPrice);
-          mainTrade = null;
-        } else {
-          await openHedgeTrade('Buy', currentPrice);
-        }
-      }
-      break;
-    case 'STOP_LOSS_SHORT':
-      if (mainTrade && mainTrade.side === 'Sell') {
-        const breakthrough = getBreakthroughPrice(mainTrade);
-        if (currentPrice < breakthrough) {
-          await closeMainTrade(currentPrice);
-          mainTrade = null;
-        } else {
-          await openHedgeTrade('Buy', currentPrice);
-        }
-      }
+    default:
       break;
   }
 
-  // --- Hedge Trade Logic: CLOSE only on STOP_LOSS_LONG or STOP_LOSS_SHORT (with price above/below breakthrough) ---
-  hedgeTrade = state.getHedgeTrade();
-  if (hedgeTrade) {
-    const hedgeBreakthrough = getBreakthroughPrice(hedgeTrade, 'hedge');
-    if (
-      (hedgeTrade.side === 'Buy' && signal === 'STOP_LOSS_LONG' && currentPrice > hedgeBreakthrough) ||
-      (hedgeTrade.side === 'Sell' && signal === 'STOP_LOSS_SHORT' && currentPrice < hedgeBreakthrough)
-    ) {
-      await closeHedgeTrade(currentPrice);
-      trailHedgeBoundary(hedgeTrade.side, currentPrice);
-      sendMessage(`Hedge trade closed on ${signal} and price above breakthrough. New hedge boundary set.`);
-    }
-  }
   state.saveState();
 }
 
-// --- Main trade hedge boundary logic correction ---
+/**
+ * ====================== MONITOR LOOP ======================
+ */
 async function monitorPrice() {
   monitoring = true;
+
   while (monitoring && state.isRunning()) {
     try {
-      const currentPrice = getCurrentPrice();
-      const signal = await analyze();
-      await handleSignal(signal, currentPrice);
-       await autoHedgeCheck(currentPrice, signal);
+      const price = getCurrentPrice();
+      if (price == null || Number.isNaN(price)) {
+        await new Promise(r => setTimeout(r, 250));
+        continue;
+      }
 
-      // --- Main hedge boundary trailing and trigger logic ---
-      const mainTrade = state.getMainTrade();
-      const mainHedgeBoundary = state.getMainHedgeBoundary();
+      const signal = await analyze().catch(() => null);
+      await handleSignal(signal, price);
 
-      if (mainTrade && mainHedgeBoundary) {
-        // Trail boundary only in one direction
-        trailMainHedgeBoundary(mainTrade.side, mainTrade.openPrice, currentPrice);
+      // Main trailing update + boundary hit check
+      const main = state.getMainTrade();
+      const boundary = state.getMainHedgeBoundary();
 
-        const breakthrough = getBreakthroughPrice(mainTrade);
-        // If price drops back to the hedge boundary
-        if (
-          (mainTrade.side === 'Buy' && currentPrice <= mainHedgeBoundary.boundary) ||
-          (mainTrade.side === 'Sell' && currentPrice >= mainHedgeBoundary.boundary)
-        ) {
-          // If hedge boundary is above breakthrough (for BUY), below for SELL
-          if (
-            (mainTrade.side === 'Buy' && mainHedgeBoundary.boundary > breakthrough) ||
-            (mainTrade.side === 'Sell' && mainHedgeBoundary.boundary < breakthrough)
-          ) {
-            // Close main trade and wait for new signal
-            await closeMainTrade(currentPrice);
-            sendMessage('Main trade closed as price dropped to trailing hedge boundary above breakthrough. Waiting for new signal.');
-          } else {
-            // Open hedge trade
-            await openHedgeTrade(mainTrade.side === 'Buy' ? 'Sell' : 'Buy', currentPrice);
-            sendMessage('Hedge trade opened as price dropped to trailing hedge boundary at/below breakthrough.');
+      if (main) {
+        trailMainBoundary(main, price);
+
+        if (boundary) {
+          const hit =
+            (main.side === 'Buy' && price <= boundary.boundary) ||
+            (main.side === 'Sell' && price >= boundary.boundary);
+
+          if (hit) {
+            await onMainBoundaryHit(price);
           }
         }
       }
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(r => setTimeout(r, 1000));
     } catch (err) {
-      sendMessage(`Monitor error: ${err.message}`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      sendMessage(`Monitor error: ${err?.message || err}`);
+      await new Promise(r => setTimeout(r, 1500));
     }
   }
 }
 
-// Auto-hedge logic (existing, for completeness)
-async function autoHedgeCheck(currentPrice, signal) {
-  const mainTrade = state.getMainTrade();
-  const hedgeTrade = state.getHedgeTrade();
-  if (mainTrade && !signal && !hedgeTrade) {
-    if (mainTrade.side === 'Buy' && currentPrice <= mainTrade.openPrice - PROFIT_POINT) {
-      await openHedgeTrade('Sell', currentPrice);
-      sendMessage('Auto-hedge SELL opened as price dropped 300 points below main BUY trade!');
-    }
-    if (mainTrade.side === 'Sell' && currentPrice >= mainTrade.openPrice + PROFIT_POINT) {
-      await openHedgeTrade('Buy', currentPrice);
-      sendMessage('Auto-hedge BUY opened as price rose 300 points above main SELL trade!');
-    }
-  }
-}
-
+/**
+ * ====================== LIFECYCLE ======================
+ */
 async function startBot() {
   startPolling(1000);
   await waitForFirstPrice();
@@ -327,9 +321,18 @@ function resumeBotState() {
   const hedgeTrade = state.getHedgeTrade();
   const lastSignal = state.getLastSignal();
   const lastPrice = state.getLastPrice();
-  if (mainTrade) sendMessage(`Resuming main trade: ${mainTrade.side} at ${mainTrade.openPrice}`);
-  if (hedgeTrade) sendMessage(`Resuming hedge trade: ${hedgeTrade.side} at ${hedgeTrade.openPrice}`);
-  if (lastSignal && lastPrice) sendMessage(`Last signal: ${lastSignal}, Last price: ${lastPrice}`);
+
+  if (mainTrade) {
+    sendMessage(
+      `Resuming MAIN ${mainTrade.side} @ ${mainTrade.openPrice} (breakthrough ${mainTrade.breakthrough}).`
+    );
+  }
+  if (hedgeTrade) {
+    sendMessage(
+      `Resuming HEDGE ${hedgeTrade.side} @ ${hedgeTrade.openPrice} (breakthrough ${hedgeTrade.breakthrough}).`
+    );
+  }
+  if (lastSignal && lastPrice != null) sendMessage(`Last signal: ${lastSignal} @ ${lastPrice}`);
 }
 
 function clearBotState() {
